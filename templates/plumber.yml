@@ -1,4 +1,5 @@
 # Lab: a component feature, to exercise feat(component) in the release notes.
+# Lab: a component fix, to exercise fix(component) in the release notes.
 # Source of truth: https://github.com/getplumber/plumber/blob/main/templates/plumber.yml
 spec:
   inputs:
