@@ -1,0 +1,91 @@
+name: Release
+
+# LAB ONLY: the smallest release that gives propagate.yml what the real
+# release.yml gives it -- a v${VERSION} tag whose templates/plumber.yml pins
+# an image digest labelled #v${VERSION}, and a GitHub release -- then calls
+# propagate.yml exactly like the real pipeline does. The image is fake (one
+# file, FROM scratch, on ghcr.io) and the release note is static.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (no leading v), e.g. 0.7.13
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    name: Fake release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      version: ${{ inputs.version }}
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Build and push the fake image
+        id: image
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version: ${VERSION}"; exit 1; }
+          image="ghcr.io/${GITHUB_REPOSITORY}:${VERSION}"
+          ctx="$(mktemp -d)"
+          echo "$VERSION" > "$ctx/VERSION"
+          printf 'FROM scratch\nCOPY VERSION /VERSION\n' > "$ctx/Dockerfile"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" -t "$image" "$ctx"
+          docker push "$image"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image" | sed 's/.*@//')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest: '${digest}'"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${image} (${digest})"
+
+      - name: Pin the image, commit, tag
+        env:
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sed -i -E 's~(getplumber/plumber@sha256:)[a-f0-9]+(" #)v[0-9]+\.[0-9]+\.[0-9]+~\1'"${DIGEST#sha256:}"'\2v'"$VERSION"'~' templates/plumber.yml
+          grep -qF "getplumber/plumber@${DIGEST}\" #v${VERSION}" templates/plumber.yml \
+            || { echo "::error::templates/plumber.yml has no digest-pinned image line to update"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): ${VERSION} [skip ci]"
+          git tag "v${VERSION}"
+          git push --atomic origin main "refs/tags/v${VERSION}"
+
+      - name: Create the GitHub release
+        env:
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf 'Lab release v%s.\n\nFake image: `ghcr.io/%s@%s`.\n' "$VERSION" "$GITHUB_REPOSITORY" "$DIGEST" > notes.md
+          gh release create "v${VERSION}" --title "v${VERSION}" --notes-file notes.md --verify-tag
+
+  propagate:
+    name: Propagate Release
+    needs: release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/propagate.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+      digest: ${{ needs.release.outputs.digest }}
+    secrets:
+      GITLAB_COMPONENT_TOKEN: ${{ secrets.GITLAB_COMPONENT_TOKEN }}
